@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib
-matplotlib.use("Agg") # Para evitar errores de interfaz gráfica
+matplotlib.use("Agg") 
 import matplotlib.pyplot as plt
 import umap
 from pathlib import Path
@@ -115,6 +115,7 @@ datasets_emb = {
 # ==========================================
 # 4.Training MLP classifier on embeddings and saving results
 # ==========================================
+
 experiment_grid = [
     ("HVG1000", "Real"),
     ("DEG", "Real"),

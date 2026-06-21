@@ -9,18 +9,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import pandas as pd
-try:
-    import umap
-except ImportError:
-    umap = None
-try:
-    import seaborn as sns
-except ImportError:
-    sns = None
-try:
-    import matplotlib.pyplot as plt
-except ImportError:
-    plt = None
+import umap
+import seaborn as sns
+import matplotlib.pyplot as plt
 from scipy.ndimage import uniform_filter1d
 from sklearn.metrics import accuracy_score, f1_score, precision_score, roc_auc_score
 from sklearn.metrics import recall_score

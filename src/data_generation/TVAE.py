@@ -22,7 +22,7 @@ from calm_data_generator.generators.tabular import RealGenerator, QualityReporte
 
 
 # =========================
-# Configuracion
+# Configuration
 # =========================
 CLINICAL_INPUT_CSV = "data/clinic_data_ppmi_no_mutation.csv"
 OMIC_INPUT_CSV = "data/omic_data_ppmi_no_mutation_protein_coding.csv"
