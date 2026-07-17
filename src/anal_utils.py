@@ -9,15 +9,25 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import pandas as pd
-import umap
-import seaborn as sns
-import matplotlib.pyplot as plt
+try:
+    import umap
+except ImportError:
+    umap = None
+try:
+    import seaborn as sns
+except ImportError:
+    sns = None
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
 from scipy.ndimage import uniform_filter1d
 from sklearn.metrics import accuracy_score, f1_score, precision_score, roc_auc_score
 from sklearn.metrics import recall_score
 from sklearn.metrics import balanced_accuracy_score
 import os
 import gc
+from pathlib import Path
 import importlib
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from sklearn.linear_model import LogisticRegression
@@ -290,13 +300,13 @@ def extract_data(ppmi_root):
     return df_train_real, df_test_real
 
 
-def _find_generar_sinteticos_root(ppmi_root):
-    """Locate the repository-level generar_sinteticos folder."""
+def _find_processed_root(ppmi_root):
+    """Locate the repository-level processed folder."""
     ppmi_path = Path(ppmi_root).resolve()
     for candidate in [ppmi_path, *ppmi_path.parents]:
-        generar_root = candidate / "data" / "generar_sinteticos"
-        if generar_root.exists():
-            return generar_root
+        processed_root = candidate / "data" / "processed"
+        if processed_root.exists():
+            return processed_root
     return None
 
 
@@ -325,11 +335,18 @@ def _align_split_columns(real_frames, synthetic_frame):
     synthetic_aligned = synthetic_frame[["diagnosis", *shared_gene_cols]].copy()
     return aligned_frames, synthetic_aligned, shared_gene_cols
 
+def load_real_split(split_path: Path, prefix: str, label_col: str):
+    df = pd.read_csv(split_path, index_col=0)
+    if label_col not in df.columns:
+        raise ValueError(f"Missing '{label_col}' column in {split_path}")
+    df = df.copy()
+    df.index = [f"{prefix}_{i}" for i in range(len(df))]
+    return df
 
-def _load_generar_sinteticos_merged(generar_root, dataset_name):
-    print(f"Loading train/val/test splits and synthetic data {generar_root} repository...")
-    split_dir = generar_root / "splits"
-    synthetic_root = generar_root / "synthetic"
+def _load_processed_merged(processed_root, dataset_name):
+    print(f"Loading train/val/test splits and synthetic data {processed_root} repository...")
+    split_dir = processed_root / "splits"
+    synthetic_root = processed_root / "synthetic"
     if not split_dir.exists() or not synthetic_root.exists():
         return None
 
@@ -361,13 +378,13 @@ def _load_generar_sinteticos_merged(generar_root, dataset_name):
     return df_merged, cell_group_names, gene_names, sample_by_gene_expr_matrix
 
 def prepare_ppmi_data(ppmi_root, dataset_name):
-    """Load the generar_sinteticos real train/val/test split and synthetic rows.
+    """Load the processed real train/val/test split and synthetic rows.
 
     Falls back to the older PPMI layout if the new folder structure is not
     available in the workspace.
     """
     ppmi_root = Path(ppmi_root)
-    merged = _load_generar_sinteticos_merged(ppmi_root, dataset_name)
+    merged = _load_processed_merged(ppmi_root, dataset_name)
     if merged is not None:
         return merged
 
@@ -937,7 +954,6 @@ def save_phase1_artifacts(
     dict
         Dictionary with saved file paths.
     """
-    from pathlib import Path
     import json
     import time
 
@@ -947,7 +963,7 @@ def save_phase1_artifacts(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Save best params
-    params_path = out_dir / "best_params32.json"
+    params_path = out_dir / "best_params.json"
     with params_path.open("w") as fh:
         json.dump(best_params, fh, indent=2)
 
@@ -966,7 +982,7 @@ def save_phase1_artifacts(
         try:
             import torch
 
-            model_path = out_dir / "best_model32.pt"
+            model_path = out_dir / "best_model.pt"
             torch.save({"model_state": sd, "params": best_params}, model_path)
         except Exception:
             model_path = None
@@ -974,7 +990,7 @@ def save_phase1_artifacts(
     # Save checkpoint metadata
     checkpoint_path = None
     if checkpoint_src is not None:
-        checkpoint_path = out_dir / "checkpoint32.json"
+        checkpoint_path = out_dir / "checkpoint.json"
         with checkpoint_path.open("w") as fh:
             json.dump({"checkpoint": str(checkpoint_src), "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S")}, fh, indent=2)
 
@@ -989,7 +1005,7 @@ def save_phase1_artifacts(
             test_labels = _np.asarray(test_labels)
             
             metrics = compute_full_metrics(test_labels, test_preds)
-            metrics_path = out_dir / "metrics32.json"
+            metrics_path = out_dir / "metrics.json"
             with metrics_path.open("w") as fh:
                 json.dump(metrics, fh, indent=2)
         except Exception:
@@ -1463,3 +1479,154 @@ def get_rf_variable_importance(
     }).sort_values(by="importance", ascending=False).reset_index(drop=True)
 
     return df_importance, model
+
+
+def plot_best_mlp_diagnostics_grid(payloads, section_title, dataset_order, results_dir):
+    """Plot a grid of MLP training diagnostics (loss and balanced accuracy) for each dataset and training setup."""
+    if not payloads:
+        print(f"No history available for {section_title}")
+        return
+
+    payload_map = {(p["dataset"], p["train_setup"]): p for p in payloads}
+    n_items = len(dataset_order)
+
+    fig, axes = plt.subplots(n_items, 2, figsize=(14, 4.5 * n_items), squeeze=False)
+    fig.suptitle(f"{section_title}\nTraining diagnostics", fontsize=16, fontweight="bold", y=1.01)
+
+    for row_idx, key in enumerate(dataset_order):
+        payload = payload_map.get(key)
+        ax_loss, ax_ba = axes[row_idx, 0], axes[row_idx, 1]
+        dataset_name, train_setup = key
+
+        if payload is None or not payload.get("final_history"):
+            ax_loss.axis("off")
+            ax_ba.axis("off")
+            continue
+
+        history = payload["final_history"]
+        df_hist = pd.DataFrame(history)
+        
+        required = {"epoch", "train_loss", "val_loss", "s_val_loss", "train_balanced_accuracy", "val_balanced_accuracy", "s_val_ba", "score"}
+        if not required.issubset(df_hist.columns):
+            ax_loss.axis("off")
+            ax_ba.axis("off")
+            continue
+
+        # Ensure rows are ordered by epoch and use the score argmax
+        # as the definitive best-epoch marker (matches select_best_epoch).
+        df_hist = df_hist.sort_values("epoch").reset_index(drop=True)
+        # index of the row with max score (first occurrence)
+        best_idx = int(df_hist["score"].idxmax())
+        # epoch number corresponding to the score argmax
+        best_epoch = int(df_hist.loc[best_idx, "epoch"])
+
+        # LOSS PLOT
+        ax_loss.plot(df_hist["epoch"], df_hist["train_loss"], label="Train loss", linewidth=2)
+        ax_loss.plot(df_hist["epoch"], df_hist["val_loss"], label="Validation loss", linewidth=2)
+        ax_loss.plot(df_hist["epoch"], df_hist["s_val_loss"], linestyle="--", linewidth=2, label="Smoothed val loss")
+        ax_loss.scatter(best_epoch, df_hist.loc[best_idx, "s_val_loss"], s=60, color="red", zorder=5, label=f"Best epoch ({best_epoch})")
+        ax_loss.axvline(best_epoch, linestyle=":", alpha=0.7, color="red")
+        ax_loss.set_title(f"{dataset_name} | {train_setup}\nLoss")
+        ax_loss.set_xlabel("Epoch")
+        ax_loss.set_ylabel("Loss")
+        ax_loss.grid(alpha=0.25)
+        ax_loss.legend(fontsize=8)
+
+        # BALANCED ACCURACY PLOT
+        ax_ba.plot(df_hist["epoch"], df_hist["train_balanced_accuracy"], label="Train BA", linewidth=2)
+        ax_ba.plot(df_hist["epoch"], df_hist["val_balanced_accuracy"], label="Validation BA", linewidth=2)
+        ax_ba.plot(df_hist["epoch"], df_hist["s_val_ba"], linestyle="--", linewidth=2, label="Smoothed val BA")
+        ax_ba.scatter(best_epoch, df_hist.loc[best_idx, "s_val_ba"], s=60, color="red", zorder=5, label=f"Best epoch ({best_epoch})")
+        ax_ba.axvline(best_epoch, linestyle=":", alpha=0.7, color="red")
+        ax_ba.set_ylim(0, 1)
+        ax_ba.set_title(f"{dataset_name} | {train_setup}\nBalanced Accuracy")
+        ax_ba.set_xlabel("Epoch")
+        ax_ba.set_ylabel("BA")
+        ax_ba.grid(alpha=0.25)
+        ax_ba.legend(fontsize=8)
+
+    plt.tight_layout()
+    save_path = Path(results_dir) / "mlp_diagnostics_grid.png"
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    print(f"MLP curves saved to: {save_path}")
+    plt.show()
+
+def plot_model_ba_barplots(df_results, section_title, dataset_order=None, model_order=None, load_saved=False, results_dir=None, csv = None):
+    """Generates barplots of validation and test balanced accuracy (BA) for each model and dataset."""
+    if load_saved:
+        if results_dir is None: return
+        path = Path(results_dir) / csv
+        if not path.exists():
+            print(f"No se encontró el archivo: {path}")
+            return
+        df_results = pd.read_csv(path)
+
+    if df_results is None or df_results.empty: return
+
+    dataset_order = dataset_order or sorted(df_results["dataset"].unique().tolist())
+    model_order = model_order or ["MLP", "LASSO", "RF"]
+
+    fig, axes = plt.subplots(1, 1, figsize=(10, 6), sharey=True)
+    fig.suptitle(f"{section_title}\nValidation and test BA by model", fontsize=18, fontweight="bold")
+
+    setup_df = df_results[df_results["train_setup"] == "Real"].copy()
+    setup_df["dataset_model"] = setup_df["dataset"] + " | " + setup_df["model"]
+    x_order = [f"{ds} | {mdl}" for ds in dataset_order for mdl in model_order if f"{ds} | {mdl}" in set(setup_df["dataset_model"])]
+
+    melted = setup_df.melt(id_vars=["dataset", "model", "dataset_model"], value_vars=["val_ba", "test_ba"], var_name="metric", value_name="ba")
+    melted["metric"] = melted["metric"].map({"val_ba": "Val BA", "test_ba": "Test BA"})
+
+    sns.barplot(data=melted, x="dataset_model", y="ba", hue="metric", order=x_order, hue_order=["Val BA", "Test BA"], palette={"Val BA": "#1f77b4", "Test BA": "#ff7f0e"}, ax=axes)
+
+    axes.set_title("Real", fontsize=16)
+    axes.set_xlabel("Dataset | Model", fontsize=14); axes.set_ylabel("Balanced Accuracy", fontsize=14)
+    axes.set_ylim(0, 1.18); axes.grid(axis="y", alpha=0.25)
+    axes.tick_params(axis="x", labelsize=14, rotation=35)
+    
+    for container in axes.containers:
+        axes.bar_label(container, fmt="%.3f", fontsize=12, padding=4, rotation=45)
+    axes.legend(title="Metric", fontsize=12, loc="lower right")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    save_path = Path(results_dir) / "model_ba_barplots.png"
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    print(f"BA barplots saved to: {save_path}")
+    plt.close()
+
+def plot_umap_by_class(X_test, y_test, le, dataset_name, out):
+    """
+    Generates a UMAP projection of the test set colored by the true class.
+    """
+    # 1. Configurar UMAP
+    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, random_state=42)
+    embedding = reducer.fit_transform(X_test)
+
+    # 2. Convertir etiquetas numéricas a texto original
+    labels_text = le.inverse_transform(y_test)
+
+    # 3. Crear DataFrame para Seaborn
+    df_umap = pd.DataFrame({
+        'UMAP 1': embedding[:, 0],
+        'UMAP 2': embedding[:, 1],
+        'Tissue': labels_text
+    })
+
+    # 4. Plot
+    plt.figure(figsize=(10, 7))
+    sns.scatterplot(
+        data=df_umap, 
+        x='UMAP 1', y='UMAP 2', 
+        hue='Tissue', 
+        palette='viridis', 
+        alpha=0.7, 
+        s=60
+    )
+    
+    plt.title(f"UMAP Projection - Test Set: {dataset_name}", fontsize=15)
+    plt.grid(alpha=0.3)
+    
+    # Guardar
+    save_path = Path(out) / f"umap_{dataset_name}.png"
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    print(f"UMAP saved to: {save_path}")
+    plt.show()

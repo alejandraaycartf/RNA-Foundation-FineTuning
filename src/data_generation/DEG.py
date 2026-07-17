@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-data_folder = "/home/alejandrayf/GeneRAIN/data/generar_sinteticos/splits/tejidos/colon_sigmoid_vs_colon_transverse"
+data_folder = "/home/alejandrayf/GeneRAIN/data/processed/splits/tejidos/colon_sigmoid_vs_colon_transverse"
 file_name = "combined_balanced_tissues.csv"
 label = "tissue"
 
@@ -52,7 +52,7 @@ print(f"\nFound {len(significant_genes)} significant genes.")
 print("\n--- TOP 10 BIOMARKERS ---")
 print(significant_genes['padj'].head(10))
 
-output_dir = "/home/alejandrayf/GeneRAIN/data/generar_sinteticos/splits/tejidos/colon_sigmoid_vs_colon_transverse/DEG_output"
+output_dir = "/home/alejandrayf/GeneRAIN/data/processed/splits/tejidos/colon_sigmoid_vs_colon_transverse/DEG_output"
 os.makedirs(output_dir, exist_ok=True)
 
 output_path = os.path.join(output_dir, "biomarkers_colon_sigmoid_vs_colon_transverse.csv")

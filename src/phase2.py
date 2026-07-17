@@ -1,16 +1,46 @@
 #!/usr/bin/env python3
-"""Run Phase 2 LoRA pipeline for the requested dataset/condition combinations.
-
-This script is a compact, runnable version of the notebook pipeline. It
-loads Phase 1 artifacts, builds dataloaders, performs an optional LoRA
+"""
+===============================================================================
+PHASE 2 SCRIPT (LORA FINE-TUNING)
+===============================================================================
+Run Phase 2 LoRA pipeline for the requested dataset/condition combinations.
+It loads Phase 1 artifacts, builds dataloaders, performs an optional LoRA
 grid-search (or single-run), saves best artifacts and plots, and repeats
-for the four requested combinations.
+for the requested combinations.
 
-Usage:
-    python run_phase2_all.py [--quick]
+WORKFLOW:
+---------
+  1. Data Loading   : Loads the pre-processed splits.
+  2. Initialization : Loads the best MLP hyperparameters from Phase 1 artifacts.
+  3. Fine-Tuning    : Injects LoRA adapters into GeneRAIN's attention matrices 
+                      and trains the entire pipeline (LoRA + MLP) end-to-end.
+  4. Output         : Saves training curves/metrics to 'results/phase2/' and 
+                      serialized model weights (.pt) to 'artifacts/phase2/'.
 
-Options:
-    --quick             Run a reduced grid for a fast smoke test.
+USAGE:
+------
+    python phase2.py [--quick]
+
+OPTIONS:
+--------
+    --quick        Run a reduced grid for a fast smoke test.
+
+MANUAL CONFIGURATION VARIABLES (Must be updated by the user):
+-------------------------------------------------------------
+Modify the following variables in the Global variables section:
+
+  * PROBLEM_NAME       : Folder name of the specific problem/dataset being evaluated.
+                         (e.g., "colon_sigmoid_vs_colon_transverse", "ppmi").
+  * LABEL_COL          : The target column name to predict in your CSVs.
+                         (Note: must be "diagnosis" for PPMI, or "tissue" for tissue datasets).
+
+OPTIONAL CONFIGURATION:
+-----------------------
+  * ENABLE_MEMORY_LOGS : Boolean flag (True/False). Set to True to print detailed CUDA 
+                         memory consumption logs during training (useful to avoid OOM).
+  * LORA_RANK          : Rank (dimension) of the injected LoRA adapter matrices.
+  * ALPHA_MULT         : Scaling multiplier for the LoRA adapters.
+===============================================================================
 """
 
 
@@ -42,10 +72,14 @@ def find_repo_root(start: Path | None = None) -> Path:
 
 
 REPO_ROOT = find_repo_root()
-TEJIDO = "frontal_cortex_vs_blood"
-LORA_DIR = REPO_ROOT / "src" / "LoRA" / "phase2"
-if str(LORA_DIR) not in sys.path:
-    sys.path.insert(0, str(LORA_DIR))
+PROBLEM_NAME = "ppmi"
+LABEL_COL = "diagnosis" if PROBLEM_NAME == "ppmi" else "tissue"
+PHASE1_DIR = REPO_ROOT / "results" / PROBLEM_NAME / "phase1"
+PHASE2_DIR = REPO_ROOT / "results" / PROBLEM_NAME / "phase2"
+SPLITS_DIR = REPO_ROOT / "data" / "processed" / PROBLEM_NAME / "splits"
+GENES_DIR = REPO_ROOT / "data" / "processed" / PROBLEM_NAME / "genes"
+PROCESS_DEG = True
+PROCESS_SYNTHETIC = True
 
 from lora_utils import (
     build_lora_model,
@@ -63,7 +97,6 @@ from lora_utils import (
     set_seed,
 )
 
-
 EMB_DIM = 200
 MAX_EPOCHS = 200
 
@@ -73,8 +106,8 @@ ALPHA_MULT = 2
 LORA_DROPOUT = 0.00
 MLP_LR = 1e-4
 LORA_LR_MULT = 4.0
-OUTPUT_TAG = "nada"
-ENABLE_MEMORY_LOGS = True
+ENABLE_MEMORY_LOGS = False
+
 
 
 def get_embeddings_from_loader(model, loader, device):
@@ -275,7 +308,7 @@ def save_training_curves(history, plots_dir: Path, save_name: str = "training_cu
     return curves_path
 
 
-def run_lora_pipeline(train_loader, val_loader, test_loader, mlp_params, lora_params, checkpoint_path, phase1_dir, output_tag, save_checkpoint=False):
+def run_lora_pipeline(train_loader, val_loader, test_loader, mlp_params, lora_params, checkpoint_path, phase1_dir, save_checkpoint=False):
     device = select_cuda_device()
     set_seed(lora_params.get("seed", 42))
 
@@ -294,7 +327,7 @@ def run_lora_pipeline(train_loader, val_loader, test_loader, mlp_params, lora_pa
 
     log_memory_snapshot("before load_mlp_head")
     mlp_head = CustomMLP(input_dim=EMB_DIM, num_classes=2, dropout=mlp_params.get("dropout", 0.2)).to(device)
-    ckpt = torch.load(phase1_dir / "best_model32.pt", map_location=device)
+    ckpt = torch.load(phase1_dir / "best_model.pt", map_location=device)
     mlp_head.load_state_dict(ckpt["model_state"])
     log_memory_snapshot("after load_mlp_head")
 
@@ -371,7 +404,6 @@ def run_lora_pipeline(train_loader, val_loader, test_loader, mlp_params, lora_pa
     metrics["train_ba"] = float(best_train_ba)
     metrics["best_val_loss"] = float(best_val_loss)
     metrics["selection_score"] = float(selection_score)
-    metrics["avg_selection_score"] = float(best_val_ba_avg)
     metrics["best_val_epoch"] = int(best_epoch)
     metrics["best_epoch_window"] = int(diagnostics["window"])
     metrics["best_epoch_by_score"] = int(diagnostics["best_epoch_by_score"])
@@ -385,7 +417,7 @@ def run_lora_pipeline(train_loader, val_loader, test_loader, mlp_params, lora_pa
             save_training_curves(
                 {"train_losses": train_losses, "val_losses": val_losses, "train_bas": train_bas, "val_bas": val_bas},
                 plots_dir,
-                save_name=f"training_curves_{output_tag}.png",
+                save_name=f"training_curves.png",
                 selected_epoch=best_epoch,
             )
         except Exception as e:
@@ -396,7 +428,7 @@ def run_lora_pipeline(train_loader, val_loader, test_loader, mlp_params, lora_pa
     return metrics, best_lora_state, best_mlp_state, {"train_losses": train_losses, "val_losses": val_losses, "train_bas": train_bas, "val_bas": val_bas, "val_ba_avg": val_ba_avg.tolist(), "val_ba_avg_window": val_ba_avg_window, "overfit_checks": overfit_checks, "epoch_diagnostics": {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in diagnostics.items()}}
 
 
-def run_lora_grid_search(train_loader, val_loader, test_loader, mlp_params, lora_grid, checkpoint_path, phase1_dir, out_base, output_tag, seed, quick: bool = False):
+def run_lora_grid_search(train_loader, val_loader, test_loader, mlp_params, lora_grid, checkpoint_path, phase1_dir, out_base, seed, quick: bool = False):
     grid_items = [(r, a, lr) for r in lora_grid["lora_rank"] for a in lora_grid["alpha_mult"] for lr in lora_grid["lora_lr"]]
     results = []
     best = None
@@ -414,7 +446,7 @@ def run_lora_grid_search(train_loader, val_loader, test_loader, mlp_params, lora
         }
         log_memory_snapshot(f"before trial {trial_id+1}/{len(grid_items)}")
         try:
-            metrics, lora_state, mlp_state, history = run_lora_pipeline(train_loader, val_loader, test_loader, mlp_params, lora_params, checkpoint_path, phase1_dir, output_tag, save_checkpoint=False)
+            metrics, lora_state, mlp_state, history = run_lora_pipeline(train_loader, val_loader, test_loader, mlp_params, lora_params, checkpoint_path, phase1_dir, save_checkpoint=False)
         except Exception as exc:
             log_memory_snapshot(f"trial failed {trial_id+1}/{len(grid_items)} -> {exc}")
             gc.collect()
@@ -454,8 +486,8 @@ def run_lora_grid_search(train_loader, val_loader, test_loader, mlp_params, lora
     df = pd.DataFrame([{k: r[k] for k in ["trial", "best_val_epoch", "lora_rank", "alpha_mult", "lora_lr", "train_ba", "val_ba", "best_val_loss", "selection_score", "avg_selection_score", "test_ba", "test_f1", "test_sensitivity", "test_specificity"]} for r in results])
     df = df.sort_values(["selection_score", "val_ba"], ascending=False).reset_index(drop=True)
     if not quick:
-        df.to_csv(out_base / f"grid_search_results_{output_tag}.csv", index=False)
-        with open(out_base / f"best_config_{output_tag}.json", "w") as f:
+        df.to_csv(out_base / f"grid_search_results.csv", index=False)
+        with open(out_base / f"best_config.json", "w") as f:
             json.dump(best[0], f, indent=2)
     return best
 
@@ -464,23 +496,21 @@ def run_phase2_combo(dataset: str, condition: str, checkpoint_path: Path, quick:
     print(f"Running combo: {dataset} | {condition}")
     log_memory_snapshot(f"enter combo {dataset} | {condition}")
     date_tag = datetime.now().strftime("%Y-%m-%d")
-    output_tag = OUTPUT_TAG
-    if TEJIDO is not None:
-        phase1_dir = REPO_ROOT / "results" / "tejidos" / "phase1" / TEJIDO / dataset / condition
-    else:
-        phase1_dir = REPO_ROOT / "results" / "phase1" / dataset / condition
-    with open(phase1_dir / "best_params32.json") as f:
+    phase1_dir = PHASE1_DIR / dataset / condition
+    out_base = PHASE2_DIR / dataset / condition
+    with open(phase1_dir / "best_params.json") as f:
         mlp_params = json.load(f)
 
     df_train, df_val, df_test, df_syn = load_dataframes(
-        dataset,
-        condition,
-        data_root=REPO_ROOT / "data" / "generar_sinteticos",
+        problem_name=PROBLEM_NAME,
+        dataset=dataset,
+        condition=condition,
+        proj_path=REPO_ROOT / "data" / "processed"
     )
-    train_dataset = make_labeled_dataset(df_train, source=0)
-    val_dataset = make_labeled_dataset(df_val, source=0)
-    test_dataset = make_labeled_dataset(df_test, source=0)
-    syn_dataset = make_labeled_dataset(df_syn, source=1) if df_syn is not None else None
+    train_dataset = make_labeled_dataset(df_train, label_col=LABEL_COL, source=0)
+    val_dataset = make_labeled_dataset(df_val, label_col=LABEL_COL, source=0)
+    test_dataset = make_labeled_dataset(df_test, label_col=LABEL_COL, source=0)
+    syn_dataset = make_labeled_dataset(df_syn, label_col=LABEL_COL, source=1) if df_syn is not None else None
 
     train_loader = make_train_loader(train_dataset, batch_size=mlp_params["batch_size"], extra_dataset=syn_dataset if condition == "augmented" else None)
     val_loader = make_eval_loader(val_dataset, batch_size=16)
@@ -530,17 +560,12 @@ def run_phase2_combo(dataset: str, condition: str, checkpoint_path: Path, quick:
     val_emb_before, val_labels_before, _ = load_phase1_embeddings("val")
     test_emb_before, test_labels_before, _ = load_phase1_embeddings("test")
 
-    if TEJIDO is not None:
-        out_base = REPO_ROOT / "results" / "tejidos" / "phase2" / TEJIDO / condition / dataset
-    else:
-        out_base = REPO_ROOT / "results" / "phase2" / condition / dataset
-
     # Plot UMAP BEFORE LoRA (match notebook)
     if not quick:
         try:
             plots_dir = out_base / "plots"
             plots_dir.mkdir(parents=True, exist_ok=True)
-            umap_before_path = plots_dir / f"umap_before_lora_all_splits_{OUTPUT_TAG}.png"
+            umap_before_path = plots_dir / f"umap_before_lora_all_splits.png"
             plot_umap_embeddings_subplots(
                 embeddings_dict={"train": train_emb_before, "val": val_emb_before, "test": test_emb_before},
                 labels_dict={"train": train_labels_before, "val": val_labels_before, "test": test_labels_before},
@@ -561,7 +586,7 @@ def run_phase2_combo(dataset: str, condition: str, checkpoint_path: Path, quick:
 
     log_memory_snapshot(f"before grid search {dataset} | {condition}")
     try:
-        best = run_lora_grid_search(train_loader, val_loader, test_loader, mlp_params, lora_grid, checkpoint_path, phase1_dir, out_base, output_tag, seed, quick=quick)
+        best = run_lora_grid_search(train_loader, val_loader, test_loader, mlp_params, lora_grid, checkpoint_path, phase1_dir, out_base, seed, quick=quick)
     except Exception as exc:
         log_memory_snapshot(f"combo failed during grid {dataset} | {condition} -> {exc}")
         gc.collect()
@@ -573,14 +598,14 @@ def run_phase2_combo(dataset: str, condition: str, checkpoint_path: Path, quick:
 
     # Save best artifacts
     out_base.mkdir(parents=True, exist_ok=True)
-    torch.save({"lora_state": best_lora_state, "mlp_state": best_mlp_state, "mlp_params": mlp_params, "lora_params": best_lora_params}, out_base / f"best_model_{output_tag}.pt")
+    torch.save({"lora_state": best_lora_state, "mlp_state": best_mlp_state, "mlp_params": mlp_params, "lora_params": best_lora_params}, out_base / f"best_model.pt")
     if not quick:
-        with open(out_base / f"metrics_{output_tag}.json", "w") as f:
+        with open(out_base / f"metrics.json", "w") as f:
             json.dump(best_metrics, f, indent=2)
-        with open(out_base / f"best_params_{output_tag}.json", "w") as f:
+        with open(out_base / f"best_params.json", "w") as f:
             json.dump(best_lora_params, f, indent=2)
 
-    save_training_curves(best_history, out_base / "plots", save_name=f"training_curves_{output_tag}.png", selected_epoch=best_metrics.get("best_val_epoch"))
+    save_training_curves(best_history, out_base / "plots", save_name=f"training_curves.png", selected_epoch=best_metrics.get("best_val_epoch"))
 
     # Generate UMAP after best model
     if not quick:
@@ -596,7 +621,7 @@ def run_phase2_combo(dataset: str, condition: str, checkpoint_path: Path, quick:
             test_emb_after, test_labels_after, test_sources_after = get_embeddings_from_loader(lora_model, test_loader, device)
             plots_dir = out_base / "plots"
             plots_dir.mkdir(parents=True, exist_ok=True)
-            umap_path = plots_dir / f"umap_after_lora_all_splits_{output_tag}.png"
+            umap_path = plots_dir / f"umap_after_lora_all_splits.png"
             plot_umap_embeddings_subplots(
                 {"train": train_emb_after, "val": val_emb_after, "test": test_emb_after},
                 {"train": train_labels_after, "val": val_labels_after, "test": test_labels_after},
@@ -627,24 +652,38 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Run reduced grid for quick smoke test")
     args = parser.parse_args()
 
-    # Choose base checkpoint (user may change)
-    checkpoint = REPO_ROOT / "data" / "models" / "GeneRAIN.BERT_Pred_Genes_Binning_By_Gene.pth"
-    if not checkpoint.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    print(f"--- Starting Phase 2 for {PROBLEM_NAME.upper()} ---")
+    
+    # 1. Dynamic construction of the Phase 2 Grid
+    dataset_order = ["HVG1000"]
+    if PROCESS_DEG:
+        dataset_order.append("DEG")
 
-    combos = [
-        ("HVG1000", "original"),
-        ("DEG", "original"),
-        #("HVG1000", "augmented"),
-        #("DEG", "augmented"),
-    ]
+    train_setups = ["original"]
+    if PROBLEM_NAME == "ppmi" and PROCESS_SYNTHETIC:
+        train_setups.append("augmented")
 
-    for dataset, condition in combos:
-        try:
-            run_phase2_combo(dataset, condition, checkpoint_path=checkpoint, quick=args.quick)
-        except Exception as exc:
-            print(f"Combo failed: {dataset} {condition} -> {exc}")
+    experiment_grid = []
+    for ds in dataset_order:
+        for setup in train_setups:
+            experiment_grid.append((ds, setup))
 
+    print(f"[INFO] Grid configured with {len(experiment_grid)} combinations:")
+    for exp in experiment_grid:
+        print(f"  -> {exp}")
+
+    # 2. Checkpoint for the base GeneRAIN model
+    checkpoint_path = REPO_ROOT / "data" / "models" / "GeneRAIN.BERT_Pred_Genes_Binning_By_Gene.pth"
+
+    # 3. Run all combos sequentially
+    for ds_name, condition in experiment_grid:
+        run_phase2_combo(
+            dataset=ds_name,
+            condition=condition,
+            checkpoint_path=checkpoint_path,
+            quick=args.quick,
+            seed=42
+        )
 
 if __name__ == "__main__":
     main()

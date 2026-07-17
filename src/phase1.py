@@ -1,3 +1,43 @@
+"""
+===============================================================================
+PHASE 1 SCRIPT (ZERO-SHOT LATENT EXTRACTION & MLP EVALUATION)
+===============================================================================
+Extracts latent representations (embeddings) from the frozen GeneRAIN 
+foundation model and evaluates them using a Multi-Layer Perceptron (MLP) 
+classifier on both HVG1000 and DEG datasets.
+
+WORKFLOW:
+---------
+  1. Data Loading & Binning: Reads pre-processed train/val/test splits and 
+                             applies 'Binning-By-Gene' normalization using 
+                             the ARCHS4 reference data.
+  2. Latent Extraction     : Passes the normalized expression data through the 
+                             frozen GeneRAIN model to extract 200D embeddings.
+  3. Modeling              : Trains and optimizes an MLP classifier on the 
+                             extracted embeddings.
+  4. Output                : Saves classification metrics ('best_config_generain.csv') 
+                             and generates UMAP scatter plots for latent analysis.
+
+MANUAL CONFIGURATION VARIABLES (Must be updated by the user):
+-------------------------------------------------------------
+Modify the following variables in the "Global configuration" section:
+
+  * PROBLEM_NAME   : Folder name of the specific problem/dataset being evaluated.
+                     (e.g., "colon_sigmoid_vs_colon_transverse", "ppmi").
+  * PROJ_PATH      : Absolute path to the root of the GeneRAIN repository.
+  * LABEL_COL      : The target column name to predict in your CSVs.
+                     (Note: this must be "diagnosis" if PROBLEM_NAME is "ppmi", 
+                     or "tissue" if evaluating tissue datasets).
+  * SPLITS_DIR     : Path to the directory containing train/val/test CSV splits.
+  * GENES_DIR      : Path to the directory containing gene lists (HVG1000 and DEG).
+  * PHASE1_DIR     : Path to the directory where Phase 1 results will be saved.
+  * PROCESS_DEG    : Set to True if you want to process the DEG dataset as well.
+  * CHECKPOINT     : Path to the downloaded GeneRAIN model weights (.pth).
+  * PARAM_JSON     : Path to the GeneRAIN model configuration file (.json).
+  * CUDA_VISIBLE_DEVICES : GPU ID allocated for execution (e.g., "0" or "1").
+===============================================================================
+"""
+
 import os
 import sys
 import numpy as np
@@ -14,24 +54,32 @@ from IPython.display import display
 
 # ==========================================
 # 1. Global configuration and paths
-# ==========================================
-TEJIDO = "colon_sigmoid_vs_colon_transverse"  
-PROJ_PATH   = "/home/alejandrayf/GeneRAIN"
-SPLITS_DIR  = f"{PROJ_PATH}/data/generar_sinteticos/splits/tejidos/{TEJIDO}"
-GENES_DIR   = f"{PROJ_PATH}/data/generar_sinteticos/genes/tejidos/{TEJIDO}"
+# ========================================
+def find_repo_root(start: Path | None = None) -> Path:
+    here = (start or Path.cwd()).resolve()
+    for candidate in [here, *here.parents]:
+        if (candidate / "config.json").exists() and (candidate / "src").is_dir():
+            return candidate
+    raise FileNotFoundError("Could not find repo root (expected config.json + src/)")
+
+PROBLEM_NAME = "colon_sigmoid_vs_colon_transverse"  
+PROJ_PATH   = find_repo_root()
+SPLITS_DIR  = f"{PROJ_PATH}/data/processed/{PROBLEM_NAME}/splits"  
+GENES_DIR   = f"{PROJ_PATH}/data/processed/{PROBLEM_NAME}/genes"
 # Phase 2 will use the same directory structure as Phase 1 for consistency:
-PHASE1_DIR  = Path(PROJ_PATH) / "results" /"tejidos" / "phase1" / TEJIDO
-RESULTS_CSV = PHASE1_DIR / "best_config_generain.csv"
+PHASE1_DIR  = f"{PROJ_PATH}/results/{PROBLEM_NAME}/phase1"
+RESULTS_CSV = f"{PHASE1_DIR}/best_config_generain.csv"
 
 PARAM_JSON  = f"{PROJ_PATH}/jsons/exp3_BERT_Pred_Genes_Binning_By_Gene.param_config.json"
 CHECKPOINT  = f"{PROJ_PATH}/data/models/GeneRAIN.BERT_Pred_Genes_Binning_By_Gene.pth"
 LABEL_COL   = "tissue"
+PROCESS_DEG = False 
 
 os.environ['PARAM_JSON_FILE'] = PARAM_JSON
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 sys.path.append(f"{PROJ_PATH}/src")
-sys.path.append(PROJ_PATH)
+sys.path.append(str(PROJ_PATH))
 
 from utils.config_loader import Config
 import anal_utils as au
@@ -41,32 +89,9 @@ from utils.checkpoint_utils import load_checkpoint
 from data.GetBinsByGeneForNewSamples import get_bins_by_gene_for_new_samples
 from train.common import initiate_model
 
-PHASE1_DIR.mkdir(parents=True, exist_ok=True)
+Path(PHASE1_DIR).mkdir(parents=True, exist_ok=True)
 pd.set_option("display.max_colwidth", None)
 config = Config()
-
-def _load_real_split(split_path: Path, prefix: str):
-    df = pd.read_csv(split_path, index_col=0)
-    df.index = [f"{prefix}_{i}" for i in range(len(df))]
-    return df
-
-# ==========================================
-# 2. Loading data splits and preparing binned datasets for HVG1000 and DEG
-# ==========================================
-print("--- Loading data splits ---")
-df_train_real = _load_real_split(Path(SPLITS_DIR) / "train.csv", "RealTrain")
-df_val_real   = _load_real_split(Path(SPLITS_DIR) / "val.csv", "RealVal")
-df_test_real  = _load_real_split(Path(SPLITS_DIR) / "test.csv", "RealTest")
-df_merged_all = pd.concat([df_train_real, df_val_real, df_test_real], axis=0)
-
-# Loading gene lists for HVG1000 and DEG datasets
-with open(Path(GENES_DIR) / "top1000_hvg.txt", "r") as f:
-    hvg_1000_genes = [line.strip() for line in f if line.strip()]
-with open(Path(GENES_DIR) / "degs_filtered.txt", "r") as f:
-    deg_genes = [line.strip() for line in f if line.strip()]
-
-samples_subsampled_file = config.proj_path + "/data/external/ARCHS/normalize_each_gene/human_gene_v2.2_with_zero_expr_genes_bin_tot2000_gene2vec_0.005_subsampled.npy"
-symbol_file = config.proj_path + "/data/external/ARCHS/normalize_each_gene/human_gene_v2.2_with_zero_expr_genes_bin_tot2000_gene2vec_0.005_subsampled.gene_symbols.txt"
 
 def prepare_binned_adata(df_merged, gene_list):
     df_sub = df_merged[[LABEL_COL, *gene_list]].copy()
@@ -86,11 +111,31 @@ def prepare_binned_adata(df_merged, gene_list):
     )
     return df_sub, adata, mask_samples
 
+# ==========================================
+# 2. Loading data splits and preparing binned datasets for HVG1000 and DEG
+# ==========================================
+samples_subsampled_file = config.proj_path + "/data/external/ARCHS/normalize_each_gene/human_gene_v2.2_with_zero_expr_genes_bin_tot2000_gene2vec_0.005_subsampled.npy"
+symbol_file = config.proj_path + "/data/external/ARCHS/normalize_each_gene/human_gene_v2.2_with_zero_expr_genes_bin_tot2000_gene2vec_0.005_subsampled.gene_symbols.txt"
+
+print("--- Loading data splits ---")
+df_train_real = au.load_real_split(Path(SPLITS_DIR) / "train.csv", "RealTrain", LABEL_COL)
+df_val_real   = au.load_real_split(Path(SPLITS_DIR) / "val.csv", "RealVal", LABEL_COL)
+df_test_real  = au.load_real_split(Path(SPLITS_DIR) / "test.csv", "RealTest", LABEL_COL)
+df_merged_all = pd.concat([df_train_real, df_val_real, df_test_real], axis=0)
+
+# Loading gene lists for HVG1000 and DEG datasets
+with open(Path(GENES_DIR) / "top1000_hvg.txt", "r") as f:
+    hvg_1000_genes = [line.strip() for line in f if line.strip()]
+
 print("Binning HVG1000 data...")
 df_hvg, adata_hvg, mask_hvg = prepare_binned_adata(df_merged_all, hvg_1000_genes)
 
-print("Binning DEG data...")
-df_deg, adata_deg, mask_deg = prepare_binned_adata(df_merged_all, deg_genes)
+if PROCESS_DEG:
+    with open(Path(GENES_DIR) / "degs_filtered.txt", "r") as f:
+        deg_genes = [line.strip() for line in f if line.strip()]
+
+    print("Binning DEG data...")
+    df_deg, adata_deg, mask_deg = prepare_binned_adata(df_merged_all, deg_genes)
 
 # ==========================================
 # 3. Loading the model and extracting embeddings for HVG1000 and DEG datasets
@@ -104,22 +149,25 @@ model = model.to(device).eval()
 print("Extracting HVG1000 Embeddings...")
 emb_hvg = au.get_generain_embeddings(adata_hvg.X, adata_hvg.var_names.tolist(), model, device, batch_size=8)
 
-print("Extracting DEG Embeddings...")
-emb_deg = au.get_generain_embeddings(adata_deg.X, adata_deg.var_names.tolist(), model, device, batch_size=8)
-
-datasets_emb = {
-    "HVG1000": au.splits(df_hvg, mask_hvg, emb_hvg, label_col=LABEL_COL),
-    "DEG":     au.splits(df_deg, mask_deg, emb_deg, label_col=LABEL_COL)
-}
+datasets_emb = {}
+datasets_emb["HVG1000"] = au.splits(df_hvg, mask_hvg, emb_hvg, label_col=LABEL_COL)
+if PROCESS_DEG:
+    print("Extracting DEG Embeddings...")
+    emb_deg = au.get_generain_embeddings(adata_deg.X, adata_deg.var_names.tolist(), model, device, batch_size=8)
+    datasets_emb["DEG"]     = au.splits(df_deg, mask_deg, emb_deg, label_col=LABEL_COL)
+    experiment_grid = [
+    ("HVG1000", "Real"),
+    ("DEG", "Real"),
+    ]
+else:
+    experiment_grid = [
+    ("HVG1000", "Real"),
+    ]
 
 # ==========================================
 # 4.Training MLP classifier on embeddings and saving results
 # ==========================================
 
-experiment_grid = [
-    ("HVG1000", "Real"),
-    ("DEG", "Real"),
-]
 mlp_plot_payload = []
 results_rows = []
 
@@ -184,9 +232,9 @@ for ds_name, train_setup in experiment_grid:
     # Save artifacts for Phase 1 (numpy arrays, best_params.json, best_model.pt)
     # -------------------------------------------------------------
     condition = "original" if train_setup == "Real" else "augmented"
-    out_dir = PHASE1_DIR / ds_name / condition
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
+    out_dir = Path(f"{PHASE1_DIR}/{ds_name}/{condition}")
+    os.makedirs(out_dir, exist_ok=True)
+
     print(f"Saving numpy arrays to {out_dir} ...")
     np.save(out_dir / "emb_train.npy", ds["X_train_real"])
     np.save(out_dir / "labels_train.npy", ds["y_train_real_enc"])
@@ -217,140 +265,33 @@ if results_rows:
     df_results.to_csv(RESULTS_CSV, index=False)
     print(f"Results saved in {RESULTS_CSV}")
 
-def plot_umap_by_class(X_test, y_test, le, dataset_name, save_dir):
-    """Genera un UMAP del set de test coloreado por la clase real."""
-    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, random_state=42)
-    embedding = reducer.fit_transform(X_test)
-    labels_text = le.inverse_transform(y_test)
 
-    df_umap = pd.DataFrame({
-        'UMAP 1': embedding[:, 0], 'UMAP 2': embedding[:, 1], 'Tissue': labels_text
-    })
+if PROCESS_DEG:
+    grid = [("HVG1000", "Real"), ("DEG", "Real")]
+    dataset_order = ["HVG1000", "DEG"]
+    ds_deg = datasets_emb["DEG"]
+    au.plot_umap_by_class(ds_deg["X_test"], ds_deg["y_test_enc"], ds_deg["le"], "DEG", PHASE1_DIR)
 
-    plt.figure(figsize=(10, 7))
-    sns.scatterplot(data=df_umap, x='UMAP 1', y='UMAP 2', hue='Tissue', palette='viridis', alpha=0.7, s=60)
-    plt.title(f"UMAP Projection - Test Set: {dataset_name}", fontsize=15)
-    plt.grid(alpha=0.3)
-    
-    save_path = Path(save_dir) / f"umap_{dataset_name}.png"
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    print(f"UMAP saved to: {save_path}")
-    plt.close()
+else:
+    grid = [("HVG1000", "Real")]
+    dataset_order = ["HVG1000"]
 
-def plot_best_mlp_diagnostics_grid(payloads, section_title, dataset_order ,results_dir=PHASE1_DIR):
-    if not payloads:
-        print(f"No history available for {section_title}")
-        return
-
-    payload_map = {(p["dataset"], p["train_setup"]): p for p in payloads}
-    n_items = len(dataset_order)
-
-    fig, axes = plt.subplots(n_items, 2, figsize=(14, 4.5 * n_items), squeeze=False)
-    fig.suptitle(f"{section_title}\nTraining diagnostics", fontsize=16, fontweight="bold", y=1.01)
-
-    for row_idx, key in enumerate(dataset_order):
-        payload = payload_map.get(key)
-        ax_loss, ax_ba = axes[row_idx, 0], axes[row_idx, 1]
-        dataset_name, train_setup = key
-
-        if payload is None or not payload.get("final_history"):
-            ax_loss.axis("off"); ax_ba.axis("off"); continue
-
-        history = payload["final_history"]
-        df_hist = pd.DataFrame(history).sort_values("epoch").reset_index(drop=True)
-        
-        required = {"epoch", "train_loss", "val_loss", "s_val_loss", "train_balanced_accuracy", "val_balanced_accuracy", "s_val_ba", "score"}
-        if not required.issubset(df_hist.columns):
-            ax_loss.axis("off"); ax_ba.axis("off"); continue
-
-        best_idx = int(df_hist["score"].idxmax())
-        best_epoch = int(df_hist.loc[best_idx, "epoch"])
-
-        # LOSS PLOT
-        ax_loss.plot(df_hist["epoch"], df_hist["train_loss"], label="Train loss", linewidth=2)
-        ax_loss.plot(df_hist["epoch"], df_hist["val_loss"], label="Validation loss", linewidth=2)
-        ax_loss.plot(df_hist["epoch"], df_hist["s_val_loss"], linestyle="--", linewidth=2, label="Smoothed val loss")
-        ax_loss.scatter(best_epoch, df_hist.loc[best_idx, "s_val_loss"], s=60, color="red", zorder=5, label=f"Best epoch ({best_epoch})")
-        ax_loss.axvline(best_epoch, linestyle=":", alpha=0.7, color="red")
-        ax_loss.set_title(f"{dataset_name} | {train_setup}\nLoss")
-        ax_loss.set_xlabel("Epoch"); ax_loss.set_ylabel("Loss")
-        ax_loss.grid(alpha=0.25); ax_loss.legend(fontsize=8)
-
-        # BA PLOT
-        ax_ba.plot(df_hist["epoch"], df_hist["train_balanced_accuracy"], label="Train BA", linewidth=2)
-        ax_ba.plot(df_hist["epoch"], df_hist["val_balanced_accuracy"], label="Validation BA", linewidth=2)
-        ax_ba.plot(df_hist["epoch"], df_hist["s_val_ba"], linestyle="--", linewidth=2, label="Smoothed val BA")
-        ax_ba.scatter(best_epoch, df_hist.loc[best_idx, "s_val_ba"], s=60, color="red", zorder=5, label=f"Best epoch ({best_epoch})")
-        ax_ba.axvline(best_epoch, linestyle=":", alpha=0.7, color="red")
-        ax_ba.set_ylim(0, 1)
-        ax_ba.set_title(f"{dataset_name} | {train_setup}\nBalanced Accuracy")
-        ax_ba.set_xlabel("Epoch"); ax_ba.set_ylabel("BA")
-        ax_ba.grid(alpha=0.25); ax_ba.legend(fontsize=8)
-
-    plt.tight_layout()
-    save_path = Path(results_dir) / "mlp_diagnostics_grid.png"
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    print(f"MLP curves saved to: {save_path}")
-    plt.close()
-
-def plot_model_ba_barplots(df_results, section_title, dataset_order=None, model_order=None, load_saved_baseline=False, results_dir=None):
-    if load_saved_baseline:
-        if results_dir is None: return
-        baseline_path = Path(results_dir) / "best_config_generain.csv" 
-        if not baseline_path.exists():
-            print(f"No se encontró el archivo: {baseline_path}")
-            return
-        df_results = pd.read_csv(baseline_path)
-
-    if df_results is None or df_results.empty: return
-
-    dataset_order = dataset_order or sorted(df_results["dataset"].unique().tolist())
-    model_order = model_order or ["MLP", "LASSO", "RF"]
-
-    fig, axes = plt.subplots(1, 1, figsize=(10, 6), sharey=True)
-    fig.suptitle(f"{section_title}\nValidation and test BA by model", fontsize=18, fontweight="bold")
-
-    setup_df = df_results[df_results["train_setup"] == "Real"].copy()
-    setup_df["dataset_model"] = setup_df["dataset"] + " | " + setup_df["model"]
-    x_order = [f"{ds} | {mdl}" for ds in dataset_order for mdl in model_order if f"{ds} | {mdl}" in set(setup_df["dataset_model"])]
-
-    melted = setup_df.melt(id_vars=["dataset", "model", "dataset_model"], value_vars=["val_ba", "test_ba"], var_name="metric", value_name="ba")
-    melted["metric"] = melted["metric"].map({"val_ba": "Val BA", "test_ba": "Test BA"})
-
-    sns.barplot(data=melted, x="dataset_model", y="ba", hue="metric", order=x_order, hue_order=["Val BA", "Test BA"], palette={"Val BA": "#1f77b4", "Test BA": "#ff7f0e"}, ax=axes)
-
-    axes.set_title("Real", fontsize=16)
-    axes.set_xlabel("Dataset | Model", fontsize=14); axes.set_ylabel("Balanced Accuracy", fontsize=14)
-    axes.set_ylim(0, 1.18); axes.grid(axis="y", alpha=0.25)
-    axes.tick_params(axis="x", labelsize=14, rotation=35)
-    
-    for container in axes.containers:
-        axes.bar_label(container, fmt="%.3f", fontsize=12, padding=4, rotation=45)
-    axes.legend(title="Metric", fontsize=12, loc="lower right")
-
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    save_path = Path(results_dir) / "model_ba_barplots.png"
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    print(f"BA barplots saved to: {save_path}")
-    plt.close()
-
-plot_best_mlp_diagnostics_grid(
+au.plot_best_mlp_diagnostics_grid(
     mlp_plot_payload,
     "Best-config metrics - PHASE 1",
-    [("HVG1000", "Real"), ("DEG", "Real")],
+    grid,
     results_dir=PHASE1_DIR
 )
 
-plot_model_ba_barplots(
+au.plot_model_ba_barplots(
     df_results=None,
     section_title="Best-config BA summary - PHASE 1",
-    dataset_order=["HVG1000", "DEG"],
+    dataset_order=dataset_order,
     model_order=["MLP", "LASSO", "RF"],
-    load_saved_baseline=True,
+    load_saved=True,
     results_dir=PHASE1_DIR,
+    csv="best_config_generain.csv"
 )
 
-ds_deg = datasets_emb["DEG"]
-plot_umap_by_class(ds_deg["X_test"], ds_deg["y_test_enc"], ds_deg["le"], "DEG", PHASE1_DIR)
 ds_hvg = datasets_emb["HVG1000"]
-plot_umap_by_class(ds_hvg["X_test"], ds_hvg["y_test_enc"], ds_hvg["le"], "HVG1000", PHASE1_DIR)
+au.plot_umap_by_class(ds_hvg["X_test"], ds_hvg["y_test_enc"], ds_hvg["le"], "HVG1000", PHASE1_DIR)

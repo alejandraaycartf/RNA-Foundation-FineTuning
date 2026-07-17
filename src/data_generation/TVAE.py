@@ -17,17 +17,27 @@ from scipy.stats import levene, chi2
 from sklearn.preprocessing import LabelEncoder
 from statsmodels.stats.multitest import multipletests
 from sklearn.utils import resample
-
+from pathlib import Path
 from calm_data_generator.generators.tabular import RealGenerator, QualityReporter
 
 
 # =========================
 # Configuration
 # =========================
-CLINICAL_INPUT_CSV = "data/clinic_data_ppmi_no_mutation.csv"
-OMIC_INPUT_CSV = "data/omic_data_ppmi_no_mutation_protein_coding.csv"
-OUTPUT_SYNTHETIC_CSV = "PPMI_synthetic.csv"
-OUTPUT_DIR = "/home/alicia/qnap/synthetic/isolated/"
+def find_repo_root(start: Path | None = None) -> Path:
+    here = (start or Path.cwd()).resolve()
+    for candidate in [here, *here.parents]:
+        if (candidate / "config.json").exists() and (candidate / "src").is_dir():
+            return candidate
+    raise FileNotFoundError("Could not find repo root (expected config.json + src/)")
+
+REPO_ROOT = find_repo_root()
+
+PROBLEM_NAME = "ppmi"
+CLINICAL_INPUT_CSV = str(REPO_ROOT / "data" / "clinic_data_ppmi_no_mutation.csv")
+OMIC_INPUT_CSV = str(REPO_ROOT / "data" / "omic_data_ppmi_no_mutation_protein_coding.csv")
+OUTPUT_SYNTHETIC_CSV = str(REPO_ROOT / "data" / "processed" / PROBLEM_NAME / "synthetic" / "combined" / "synthetic_combined.csv")
+OUTPUT_DIR = str(REPO_ROOT / "data" / "processed" / PROBLEM_NAME / "synthetic" / "combined")
 
 RANDOM_STATE = 42
 N_TOP_GENES = 1000

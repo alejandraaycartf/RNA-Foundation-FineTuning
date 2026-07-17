@@ -4,16 +4,19 @@ import os
 import random
 import sys
 from pathlib import Path
+
+# --- Third-party library imports ---
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import seaborn as sns
 import torch
 import torch.nn as nn
 import umap
-import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
-from matplotlib.lines import Line2D
-import seaborn as sns
-
 from imblearn.under_sampling import RandomUnderSampler
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from peft import LoraConfig, get_peft_model
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -25,42 +28,55 @@ from sklearn.metrics import (
 )
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
 
-TEJIDO = "colon_sigmoid_vs_colon_transverse"
-LABEL_COL = "tissue"
+# ==========================================
+# 1. Global configuration and paths
+# ==========================================
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-# Ensure the project's `src` folder is on sys.path so imports like
-# `from train.common import ...` and `from utils...` resolve correctly.
-GENERAIN_SRC = str(REPO_ROOT / "src")
+# Find the repository root 
+def find_repo_root(start: Path | None = None) -> Path:
+    here = (start or Path.cwd()).resolve()
+    for candidate in [here, *here.parents]:
+        if (candidate / "config.json").exists() and (candidate / "src").is_dir():
+            return candidate
+    raise FileNotFoundError("Could not find repo root (expected config.json + src/)")
+REPO_ROOT = find_repo_root()
+
+# GeneRAIN model configuration
 PARAM_JSON = str(REPO_ROOT / "jsons" / "exp3_BERT_Pred_Genes_Binning_By_Gene.param_config.json")
-# Do not override an externally-provided config (e.g., from a notebook).
-# This matters because different GeneRAIN checkpoints require different PARAM_JSON_FILE.
 os.environ.setdefault("PARAM_JSON_FILE", PARAM_JSON)
+
+# Module paths
+GENERAIN_SRC = str(REPO_ROOT / "src")
+
+# Add src and code directories to sys.path
 if GENERAIN_SRC not in sys.path:
     sys.path.insert(0, GENERAIN_SRC)
-CODE_DIR = str(REPO_ROOT / "code")
-if CODE_DIR not in sys.path:
-    sys.path.insert(0, CODE_DIR)
 
-import pandas as pd
-from peft import LoraConfig, get_peft_model
+# Add repository root to sys.path to access anal_utils.py
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
+# ==========================================
+# 2. Local module imports
+# ==========================================
+# (These must be imported AFTER modifying sys.path)
+from anal_utils import CustomMLP, set_seed
 from data.GN_Dataset import GN_Dataset
 from train.common import initiate_model
 from train.common_params_funs import extract_hidden_states, get_pred_using_model_and_input
 from utils.checkpoint_utils import load_checkpoint
 from utils.utils import get_device
 
-SPLITS_DIR = REPO_ROOT / "data" / "generar_sinteticos" / "splits" 
+# Activation functions dictionary
 _ACT = {"relu": nn.ReLU, "gelu": nn.GELU, "tanh": nn.Tanh}
 
 
-def set_seed(seed: int = 42):
+"""def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
+"""
 
 class LabeledGNDataset(Dataset):
     """Wraps GN_Dataset and attaches a class label to each item."""
@@ -151,10 +167,10 @@ def get_embedding(lora_model, batch: dict, device: torch.device) -> torch.Tensor
     return (hs * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
 
 
-def make_labeled_dataset(df: pd.DataFrame, source: int = 0) -> LabeledGNDataset:
-    gene_cols = [c for c in df.columns if c != LABEL_COL]
+def make_labeled_dataset(df: pd.DataFrame, label_col: str, source: int = 0) -> LabeledGNDataset:
+    gene_cols = [c for c in df.columns if c != label_col]
     expr_mat = df[gene_cols].values.astype(np.float32)
-    labels = df[LABEL_COL].values
+    labels = df[label_col].values
     gn = GN_Dataset(sample_by_gene_expr_mat=expr_mat, gene_symbols=gene_cols, num_of_genes=2048)
     sources = np.full(len(labels), source, dtype=np.int64)
     return LabeledGNDataset(gn, labels, sources=sources)
@@ -189,34 +205,23 @@ def make_eval_loader(dataset: LabeledGNDataset, batch_size: int = 16) -> DataLoa
     return DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
 
-def load_dataframes(dataset, condition: str, data_root: Path | None = None):
+def load_dataframes(dataset, condition: str, data_root: Path, splits_dir: Path, genes_dir: Path, label_col: str):
     """Load train/val/test splits and optional synthetic data from
-    the `data/generar_sinteticos` structure.
-
-        Expected layout (simplest required form):
-            data/generar_sinteticos/splits/train.csv
-            data/generar_sinteticos/splits/val.csv
-            data/generar_sinteticos/splits/test.csv
+    the `data/processed` structure.
 
     If `condition == "augmented"` the function also expects a synthetic
-    combined file under `data/generar_sinteticos/synthetic/` (one of a small
+    combined file under `data/processed/synthetic/` (one of a small
     set of well-known names). This function does NOT fall back to legacy
     CSVs; it raises a clear error if required files are missing.
     """
 
-    gs_root = data_root or (REPO_ROOT / "data" / "generar_sinteticos")
-    if TEJIDO is not None:
-        splits_dir = gs_root / "splits" / "tejidos" / TEJIDO
-        genes_dir = gs_root / "genes" / "tejidos" / TEJIDO
-    else:
-        splits_dir = SPLITS_DIR
-        genes_dir = gs_root / "genes" 
+    gs_root = data_root or (REPO_ROOT / "data" / "processed")
 
     def _load_gene_list(path: Path) -> list[str]:
         return pd.read_csv(path, header=None)[0].astype(str).tolist()
 
     def _subset_to_genes(df: pd.DataFrame, genes: list[str]) -> pd.DataFrame:
-        return df[[LABEL_COL, *genes]].copy()
+        return df[[label_col, *genes]].copy()
 
     if dataset == "HVG1000":
         target_gene_list = _load_gene_list(genes_dir / "top1000_hvg.txt")
@@ -238,7 +243,7 @@ def load_dataframes(dataset, condition: str, data_root: Path | None = None):
     df_val = pd.read_csv(val_path, index_col=0)
     df_test = pd.read_csv(test_path, index_col=0)
 
-    real_gene_cols = set(df_train.columns) - {LABEL_COL}
+    real_gene_cols = set(df_train.columns) - {label_col}
     selected_gene_cols = [gene for gene in target_gene_list if gene in real_gene_cols]
     if not selected_gene_cols:
         raise ValueError(f"No target gene columns found for '{dataset}' in the real splits.")
@@ -259,7 +264,7 @@ def load_dataframes(dataset, condition: str, data_root: Path | None = None):
         df_syn = pd.read_csv(syn_path, index_col=0)
 
         # Keep only the genes that are shared with the synthetic combined set.
-        synthetic_gene_cols = {col for col in df_syn.columns if col != LABEL_COL}
+        synthetic_gene_cols = {col for col in df_syn.columns if col != label_col}
         shared_gene_cols = [gene for gene in selected_gene_cols if gene in synthetic_gene_cols]
 
         if not shared_gene_cols:
@@ -335,6 +340,7 @@ def compute_full_metrics(labels: np.ndarray, probs: np.ndarray) -> dict:
         "specificity": specificity,
     }
 
+
 def plot_umap_embeddings(embeddings, labels, title, save_path="umap_results.png"):
     """Plot single UMAP visualization."""
     if isinstance(embeddings, torch.Tensor):
@@ -367,7 +373,7 @@ def plot_umap_embeddings(embeddings, labels, title, save_path="umap_results.png"
     plt.title("Phase 2 embeddings - " + title, fontsize=14, pad=15)
     plt.xlabel("UMAP Dimension 1", fontsize=12)
     plt.ylabel("UMAP Dimension 2", fontsize=12)
-    plt.legend(title=TEJIDO, labels=[' (0)', ' (1)'], loc='best')
+    plt.legend(title=title, labels=[' (0)', ' (1)'], loc='best')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)

@@ -1,29 +1,63 @@
+"""
+This script is responsible for loading, preparing, and structuring the data 
+(both real and conditionally TVAE-generated synthetic data) to analyze and 
+interpret the different stages of the pipeline. 
+
+Depending on the selected stage (Baseline, Phase 1, or Phase 2), it dynamically 
+builds the experiment grids, loads the corresponding gene subsets (HVG1000 and DEG), 
+calculates gene expression statistics (mean and variance), and prepares the dataset 
+dictionaries needed for downstream evaluations and UMAP visualizations.
+
+MANUAL CONFIGURATION VARIABLES (Must be updated by the user):
+Modify the following variables in the configuration section of the code:
+
+* PROBLEM_NAME      : Folder name of the specific problem/dataset being evaluated.
+                      (Options: "ppmi", "colon_sigmoid_vs_colon_transverse", 
+                      "frontal_cortex_vs_blood").
+* LABEL_COL         : The target column name to predict in your CSVs.
+                      (Use "diagnosis" for PPMI, or "tissue" for tissue datasets).
+* STAGE             : The experiment stage you want to interpret.
+                      (Options: "baseline", "phase1", "phase2").
+* PROCESS_DEG       : Boolean (True/False). Set to True to process and evaluate 
+                      the Differentially Expressed Genes (DEG) dataset.
+* PROCESS_SYNTHETIC : Boolean (True/False). Set to True to append TVAE synthetic 
+                      data augmentation in the analysis.
+"""
+
 import os
-import ast
 import sys
 from pathlib import Path
 
-PROJ_PATH = "/home/alejandrayf/GeneRAIN"
-CHECKPOINT  = f"{PROJ_PATH}/data/models/GeneRAIN.BERT_Pred_Genes_Binning_By_Gene.pth"
-PARAM_JSON  = f"{PROJ_PATH}/jsons/exp3_BERT_Pred_Genes_Binning_By_Gene.param_config.json"
+import numpy as np
+import pandas as pd
+import torch
+
+def find_repo_root(start: Path | None = None) -> Path:
+    here = (start or Path.cwd()).resolve()
+    for candidate in [here, *here.parents]:
+        if (candidate / "config.json").exists() and (candidate / "src").is_dir():
+            return candidate
+    raise FileNotFoundError("Could not find repo root (expected config.json + src/)")
+
+REPO_ROOT = find_repo_root()
+PROJ_PATH = str(REPO_ROOT) 
+
+GENERAIN_SRC = str(REPO_ROOT / "src")
+if GENERAIN_SRC not in sys.path:
+    sys.path.insert(0, GENERAIN_SRC)
+
+CHECKPOINT  = str(REPO_ROOT / "data" / "models" / "GeneRAIN.BERT_Pred_Genes_Binning_By_Gene.pth")
+PARAM_JSON  = str(REPO_ROOT / "jsons" / "exp3_BERT_Pred_Genes_Binning_By_Gene.param_config.json")
 
 os.environ["PARAM_JSON_FILE"] = PARAM_JSON
 
-sys.path.append(f"{PROJ_PATH}/src")
-sys.path.append(PROJ_PATH)
-from utils.config_loader import Config
 import anal_utils as au
 from data.adata import Adata
-from utils.utils import get_device
-from utils.checkpoint_utils import load_checkpoint
 from data.GetBinsByGeneForNewSamples import get_bins_by_gene_for_new_samples
 from train.common import initiate_model
-import torch
+from utils.checkpoint_utils import load_checkpoint
 from utils.config_loader import Config
-# -----------------------------
-import numpy as np
-import pandas as pd
-import anal_utils as au
+from utils.utils import get_device
 
 try:
     from IPython.display import display
@@ -31,38 +65,18 @@ except ImportError:
     def display(obj):
         print(obj)
 
+PROBLEM_NAME = "ppmi" 
+LABEL_COL = "diagnosis" if PROBLEM_NAME == "ppmi" else "tissue"
+STAGE = "phase2" 
+PROCESS_DEG = True  
+PROCESS_SYNTHETIC = True
 
-# ---> CHANGE BASED ON THE PROBLEM <---
-PROBLEM_NAME = "ppmi" # Options: "ppmi", "colon_sigmoid_vs_colon_transverse", "frontal_cortex_vs_blood"
-LABEL_COL = "diagnosis" # Change to "tissue" if switching to tissues
-ETAPA = "phase2" # Options: "baseline", "phase1", "phase2"
-
-
-if PROBLEM_NAME == "ppmi":
-    OUTPUT_DIR = Path(PROJ_PATH) / "results" / "ppmi" / ETAPA
-    SPLITS_DIR = Path(PROJ_PATH) / "data" / "generar_sinteticos" / "splits"  
-    GENES_DIR  = Path(PROJ_PATH) / "data" / "generar_sinteticos" / "genes" 
-    
-    experiment_grid = [
-        ("HVG1000", "LASSO", "Real"), ("HVG1000", "LASSO", "Real+Synthetic"),
-        ("HVG1000", "RF", "Real"), ("HVG1000", "RF", "Real+Synthetic"),
-        ("DEG", "LASSO", "Real"), ("DEG", "LASSO", "Real+Synthetic"),
-        ("DEG", "RF", "Real"), ("DEG", "RF", "Real+Synthetic")
-    ]
-    filepath = f"{PROJ_PATH}/notebooks/anal/best_config_Baselines.csv"
-else:
-    OUTPUT_DIR = Path(PROJ_PATH) / "results" / "tejidos" / ETAPA / PROBLEM_NAME
-    SPLITS_DIR = Path(PROJ_PATH) / "data" / "generar_sinteticos" / "splits" / "tejidos" / PROBLEM_NAME
-    GENES_DIR  = Path(PROJ_PATH) / "data" / "generar_sinteticos" / "genes" / "tejidos" / PROBLEM_NAME
-    
-    experiment_grid = [
-        ("HVG1000", "LASSO", "Real"), ("HVG1000", "RF", "Real"),
-        ("DEG", "LASSO", "Real"), ("DEG", "RF", "Real")
-    ]
-    filepath = f"{PROJ_PATH}/results/tejidos/{ETAPA}/{PROBLEM_NAME}/best_config_baseline_bb.csv"
+OUTPUT_DIR = REPO_ROOT / "results" / PROBLEM_NAME / STAGE
+SPLITS_DIR = REPO_ROOT / "data" / "processed" / PROBLEM_NAME / "splits"
+GENES_DIR  = REPO_ROOT / "data" / "processed" / PROBLEM_NAME / "genes"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-print(f"Directorio de salida configurado en: {OUTPUT_DIR}")
+print(f"Output directory configured in: {OUTPUT_DIR}")
 config = Config()
 
 def _load_real_split(split_path: Path, prefix: str):
@@ -100,43 +114,67 @@ def get_params_from_csv(filepath, model_name, ds_name, train_setup):
     
 
 hvg_file = Path(GENES_DIR) / "top1000_hvg.txt"
-deg_file = Path(GENES_DIR) / "degs_filtered.txt"
-
-if not hvg_file.exists() or not deg_file.exists():
-    raise FileNotFoundError(f"¡Archivos no encontrados en {GENES_DIR}!")
+if not hvg_file.exists():
+    raise FileNotFoundError(f"HVG file not found in {GENES_DIR}!")
 
 with open(hvg_file, "r") as f:
     gene_names_hvg1000 = [line.strip() for line in f if line.strip()]
 
-with open(deg_file, "r") as f:
-    gene_names_deg = [line.strip() for line in f if line.strip()]
+if PROCESS_DEG:
+    deg_file = Path(GENES_DIR) / "degs_filtered.txt"
+    if not deg_file.exists():
+        raise FileNotFoundError(f"DEG file not found in {GENES_DIR}!")
+    with open(deg_file, "r") as f:
+        gene_names_deg = [line.strip() for line in f if line.strip()]
 
-if PROBLEM_NAME == "ppmi":
-    print("Cargando datos de PPMI (Reales y Sintéticos) usando prepare_ppmi_data...")
-    df_hvg_1000, _, _, mat_hvg_1000 = au.prepare_ppmi_data(
-        os.path.join(config.proj_path, "data/generar_sinteticos"), "hvg"
-    )
-    bool_mask_hvg = np.ones(len(df_hvg_1000), dtype=bool)
-    
-    df_deg, _, _, mat_deg = au.prepare_ppmi_data(
-        os.path.join(config.proj_path, "data/generar_sinteticos"), "deg"
-    )
-    bool_mask_deg = np.ones(len(df_deg), dtype=bool)
-else:
-    print(f"Cargando datos de tejidos ({PROBLEM_NAME}) de forma manual...")
-    df_train_real = _load_real_split(Path(SPLITS_DIR) / "train.csv", "RealTrain")
-    df_val_real   = _load_real_split(Path(SPLITS_DIR) / "val.csv", "RealVal")
-    df_test_real  = _load_real_split(Path(SPLITS_DIR) / "test.csv", "RealTest")
-    
-    df_merged_all = pd.concat([df_train_real, df_val_real, df_test_real], axis=0)
-    
-    df_hvg_1000 = df_merged_all[[LABEL_COL, *gene_names_hvg1000]].copy()
-    df_deg      = df_merged_all[[LABEL_COL, *gene_names_deg]].copy()
+# ==========================================
+# Data Loading (Unified for Real and Conditionally Synthetic)
+# ==========================================
+print("--- Loading real data splits ---")
+df_train_real = _load_real_split(SPLITS_DIR / "train.csv", "RealTrain")
+df_val_real   = _load_real_split(SPLITS_DIR / "val.csv", "RealVal")
+df_test_real  = _load_real_split(SPLITS_DIR / "test.csv", "RealTest")
 
-    mat_hvg_1000 = df_hvg_1000[gene_names_hvg1000].values.astype(np.float32)
-    mat_deg      = df_deg[gene_names_deg].values.astype(np.float32)
+# 1. Merge only real data first (contains all genes)
+df_merged_real = pd.concat([df_train_real, df_val_real, df_test_real], axis=0)
 
-    bool_mask_hvg = np.ones(len(df_hvg_1000), dtype=bool)
+# =======================
+# A) Processing HVG1000
+# =======================
+df_hvg_1000 = df_merged_real[[LABEL_COL, *gene_names_hvg1000]].copy()
+
+# Append synthetic data for HVG if requested
+if PROBLEM_NAME == "ppmi" and PROCESS_SYNTHETIC:
+    syn_hvg_path = REPO_ROOT / "data" / "processed" / PROBLEM_NAME / "synthetic" / "combined" / "combined_synthetic.csv"
+    if syn_hvg_path.exists():
+        print("Appending TVAE synthetic data for HVG...")
+        df_syn_hvg = pd.read_csv(syn_hvg_path, index_col=0)
+        df_syn_hvg.index = [f"Synthetic_{i}" for i in range(len(df_syn_hvg))]
+        df_hvg_1000 = pd.concat([df_hvg_1000, df_syn_hvg], axis=0)
+    else:
+        print(f"[WARNING] Synthetic HVG requested but not found at {syn_hvg_path}")
+
+mat_hvg_1000 = df_hvg_1000[gene_names_hvg1000].values.astype(np.float32)
+bool_mask_hvg = np.ones(len(df_hvg_1000), dtype=bool)
+
+# =======================
+# B) Processing DEG
+# =======================
+if PROCESS_DEG:
+    df_deg = df_merged_real[[LABEL_COL, *gene_names_deg]].copy()
+
+    # Append synthetic data for DEG if requested
+    if PROBLEM_NAME == "ppmi" and PROCESS_SYNTHETIC:
+        syn_deg_path = REPO_ROOT / "data" / "processed" / PROBLEM_NAME / "synthetic" / "combined_deg" / "combined_synthetic.csv"
+        if syn_deg_path.exists():
+            print("Appending TVAE synthetic data for DEG...")
+            df_syn_deg = pd.read_csv(syn_deg_path, index_col=0)
+            df_syn_deg.index = [f"Synthetic_{i}" for i in range(len(df_syn_deg))]
+            df_deg = pd.concat([df_deg, df_syn_deg], axis=0)
+        else:
+            print(f"[WARNING] Synthetic DEG requested but not found at {syn_deg_path}")
+
+    mat_deg = df_deg[gene_names_deg].values.astype(np.float32)
     bool_mask_deg = np.ones(len(df_deg), dtype=bool)
 
 mean_expr = df_hvg_1000[gene_names_hvg1000].mean()
@@ -154,7 +192,39 @@ hvg_stats_file = Path(GENES_DIR) / "top1000_hvg_con_varianza.csv"
 df_hvg_stats.to_csv(hvg_stats_file, index=False)
 print(f"HVG file saved to: {hvg_stats_file}")
 
-if ETAPA == "baseline":
+# ==========================================
+# Dynamic Experiment Grid Configuration
+# ==========================================
+# 1. Define models and filepaths based on the stage being interpreted
+if STAGE == "baseline":
+    filepath = str(REPO_ROOT / "results" / PROBLEM_NAME / STAGE / "best_config_baseline.csv")
+    model_list = ["LASSO", "RF", "MLP"]
+elif STAGE == "phase1":
+    filepath = str(REPO_ROOT / "results" / PROBLEM_NAME / STAGE / "best_config_generain.csv")
+    model_list = ["MLP"]
+else: # phase2
+    filepath = str(REPO_ROOT / "results" / PROBLEM_NAME / "phase1" / "best_params.json")
+    model_list = ["LoRA"] 
+
+# 2. Define train setups dynamically
+train_setups = ["Real"]
+if PROBLEM_NAME == "ppmi" and PROCESS_SYNTHETIC:
+    train_setups.append("Real+Synthetic")
+
+# 3. Build the grid
+experiment_grid = []
+for mod in model_list:
+    for setup in train_setups:
+        experiment_grid.append(("HVG1000", mod, setup))
+        if PROCESS_DEG:
+            experiment_grid.append(("DEG", mod, setup))
+
+print(f"[INFO] Grid configured with {len(experiment_grid)} combinations:")
+for exp in experiment_grid:
+    print(f"  -> {exp}")
+
+
+if STAGE == "baseline":
     print("----------- BASELINE -----------")
     datasets_raw = {}
     datasets_raw["HVG1000"] = au.splits(df_hvg_1000, bool_mask_hvg, mat_hvg_1000, label_col=LABEL_COL)
@@ -225,7 +295,7 @@ if ETAPA == "baseline":
             print(f"Exportando resultados de RF a: {file_path}")
             df_export_rf[["gene_name", "importance"]].to_csv(file_path, index=False)
 
-elif ETAPA == "phase1":
+elif STAGE == "phase1":
     print("----------- PHASE 1 -----------")
     samples_subsampled_file = config.proj_path + "/data/external/ARCHS/normalize_each_gene/human_gene_v2.2_with_zero_expr_genes_bin_tot2000_gene2vec_0.005_subsampled.npy"
     symbol_file = config.proj_path + "/data/external/ARCHS/normalize_each_gene/human_gene_v2.2_with_zero_expr_genes_bin_tot2000_gene2vec_0.005_subsampled.gene_symbols.txt"
@@ -294,7 +364,7 @@ elif ETAPA == "phase1":
         df_att_out.to_csv(out_file, index=False)
         print(f"Saving {ds_name} ({train_setup}) attention scores to {out_file}")
 
-elif ETAPA == "phase2":
+elif STAGE == "phase2":
     print(f"----------- PHASE 2 (LoRA) - {PROBLEM_NAME.upper()} -----------")
     
     device = get_device()

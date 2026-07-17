@@ -5,9 +5,11 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
-DEFAULT_INPUT_CSV = "combined_balanced_tissues.csv"
-SPLITS_DIR = "splits/tejidos/colon_sigmoid_vs_colon_transverse"
-GENES_DIR = "genes/tejidos/colon_sigmoid_vs_colon_transverse"
+PROBLEM_NAME = "colon_sigmoid_vs_colon_transverse" 
+DEFAULT_INPUT_CSV = f"data/processed/{PROBLEM_NAME}/combined_balanced_tissues.csv"
+SPLITS_DIR = f"data/processed/{PROBLEM_NAME}/splits"
+GENES_DIR = f"data/processed/{PROBLEM_NAME}/genes"
+
 RANDOM_STATE = 42
 N_TOP_GENES = 1000
 
