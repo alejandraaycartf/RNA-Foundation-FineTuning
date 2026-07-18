@@ -22,6 +22,7 @@ Modify the following variables in the configuration section of the code:
                       the Differentially Expressed Genes (DEG) dataset.
 * PROCESS_SYNTHETIC : Boolean (True/False). Set to True to append TVAE synthetic 
                       data augmentation in the analysis.
+* EXTRACT_ONLY_CORRECT : Boolean (True/False). Set to True to extract attention from only correctly classified samples in Phase 2 (LoRA) evaluation.
 """
 
 import os
@@ -67,9 +68,10 @@ except ImportError:
 
 PROBLEM_NAME = "ppmi" 
 LABEL_COL = "diagnosis" if PROBLEM_NAME == "ppmi" else "tissue"
-STAGE = "phase2" 
+STAGE = "baseline"  # Options: "baseline", "phase1", "phase2"
 PROCESS_DEG = True  
 PROCESS_SYNTHETIC = True
+EXTRACT_ONLY_CORRECT = False
 
 OUTPUT_DIR = REPO_ROOT / "results" / PROBLEM_NAME / STAGE
 SPLITS_DIR = REPO_ROOT / "data" / "processed" / PROBLEM_NAME / "splits"
