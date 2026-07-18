@@ -43,7 +43,7 @@ The project has been empirically validated across three scenarios with varying l
 
 ## Requirements, Installation, and Directory Structure
 
-To ensure computational reproducibility, running this project in a Conda environment using a GPU is recommended. Main dependencies include `python 3.13.12`, the `pytorch` ecosystem with CUDA, `calm-data-generator` (https://github.com/AlejandroBeldaFernandez/Calm-Data-Generator, for synthetic data generation), `pydeseq2`, `optuna`, `scanpy`, `anndata`, `umap-learn`, and `gprofiler-official`.
+To ensure computational reproducibility, running this project in a Conda environment using a GPU is recommended. Main dependencies include `python 3.13.12`, the `pytorch` ecosystem with CUDA, `calm-data-generator` (for synthetic data generation), `pydeseq2`, `optuna`, `scanpy`, `anndata`, `umap-learn`, and `gprofiler-official`.
 
 **Strict integration with GeneRAIN:**
 This project is designed to run **inside the root directory of the official GeneRAIN repository**. To set up the environment correctly, follow these steps in order:
@@ -57,7 +57,46 @@ cd GeneRAIN
 # Copy the RNA-Foundation-FineTuning scripts here
 ```
 
-### 2. Download GeneRAIN resources
+### 2. Patch GeneRAIN's native normalization script
+Since our custom pipeline already feeds pre-processed and normalized data into the foundation model, we must prevent GeneRAIN from applying a redundant library-size scaling and log10 transformation. 
+
+Open the file `src/data/GetBinsByGeneForNewSamples.py` from the GeneRAIN repository and modify the `scale_by_sample_total_count_log_transform` function to bypass the transformation. Comment out the scaling lines so it looks exactly like this:
+
+```python
+def scale_by_sample_total_count_log_transform(gene_by_sample_expr_mat, output_prefix, min_total_count=1000000, min_expr_genes=0):
+    expression_data = gene_by_sample_expr_mat
+    total_counts = np.sum(expression_data, axis=0)
+    non_zero_counts = np.count_nonzero(expression_data, axis=0)
+    mean_counts = np.mean(expression_data, axis=0)
+    median_counts = np.median(expression_data, axis=0)
+    max_counts = np.max(expression_data, axis=0)
+    valid_samples = (total_counts >= min_total_count) & (non_zero_counts > min_expr_genes)
+    expression_data = expression_data[:, valid_samples]
+    
+    # --- COMMENTED OUT TO AVOID DOUBLE NORMALIZATION ---
+    # total_counts_valid = total_counts[valid_samples]
+    # scaling_factors = 10000000 / total_counts_valid
+    # normalized_expression = expression_data * scaling_factors[np.newaxis, :]
+    # log_transformed_expression = np.log10(normalized_expression + 1)
+    
+    log_transformed_expression = expression_data
+    # ---------------------------------------------------
+
+    stats_df = pd.DataFrame({
+        'total_read_counts': total_counts,
+        'non_zero_genes': non_zero_counts,
+        'mean_read_counts': mean_counts,
+        'median_read_counts': median_counts,
+        'max_read_counts': max_counts,
+        'valid_samples': valid_samples
+    })
+    
+    if output_prefix != None:
+        stats_df.to_csv(f'{output_prefix}_stats.tsv', sep='\t', header=True, index=False)
+    return log_transformed_expression.astype(np.float32), valid_samples, stats_df
+```
+
+### 3. Download GeneRAIN resources
 You must download the files provided by the original GeneRAIN authors (available on their Zenodo/attachments) and place them **exactly** in the following paths:
 
 *   **Pretrained model weights (`.pth`):**
@@ -68,7 +107,8 @@ You must download the files provided by the original GeneRAIN authors (available
     You must download the `.npy` and `.txt` files from ARCHS4 and place them in: `data/external/ARCHS/normalize_each_gene/`. 
     *(Example: `human_gene_v2.2_with_zero_expr_genes_bin_tot2000_gene2vec_0.005_subsampled.npy` and its corresponding `.txt` symbol file)*.
 
-### 3. Create the project directory structure
+
+### 4. Create the project directory structure
 Our Fine-Tuning and Data Augmentation pipeline uses a dynamic directory structure based on the `PROBLEM_NAME` variable. The scripts assume that raw data, partitions, gene lists, and TVAE synthetic data are strictly separated by problem.
 
 Run the following command in your terminal (while at the root of `GeneRAIN`) to instantly create all the necessary folders for the 3 study cases (`ppmi`, `colon_sigmoid_vs_colon_transverse`, and `frontal_cortex_vs_blood`):
@@ -95,7 +135,7 @@ mkdir -p data/external/GTEX
 mkdir -p data/external/PPMI
 ```
 
-### 4. Location of input data (Raw Data)
+### 5. Location of input data (Raw Data)
 Before running the partitioning scripts, you must place the raw data downloaded from GTEx or PPMI into their corresponding folders:
 *   GTEx `.gct.gz` files must go into `data/external/GTEX/`.
 *   PPMI clinical and omic files must go into `data/external/PPMI/`.
