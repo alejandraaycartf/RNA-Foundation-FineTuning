@@ -43,7 +43,7 @@ The project has been empirically validated across three scenarios with varying l
 
 ## Requirements, Installation, and Directory Structure
 
-To ensure computational reproducibility, running this project in a Conda environment using a GPU is recommended. Main dependencies include `python 3.13.12`, the `pytorch` ecosystem with CUDA, `calm-data-generator` (for synthetic data generation), `pydeseq2`, `optuna`, `scanpy`, `anndata`, `umap-learn`, and `gprofiler-official`.
+To ensure computational reproducibility, running this project in a Conda environment using a GPU is recommended. Main dependencies include `python 3.13.12`, the `pytorch` ecosystem with CUDA, `calm-data-generator` (https://github.com/AlejandroBeldaFernandez/Calm-Data-Generator, for synthetic data generation), `pydeseq2`, `optuna`, `scanpy`, `anndata`, `umap-learn`, and `gprofiler-official`.
 
 **Strict integration with GeneRAIN:**
 This project is designed to run **inside the root directory of the official GeneRAIN repository**. To set up the environment correctly, follow these steps in order:
